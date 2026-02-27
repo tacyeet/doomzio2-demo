@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Doomz Layers + Chunking Demo (2 layers)</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="hud">
+    <div class="row">
+      <div class="pill">WASD: move</div>
+      <div class="pill">Shift: sprint</div>
+      <div class="pill">E: enter/exit entrance</div>
+      <div class="pill">F: toggle debug</div>
+    </div>
+    <div class="row">
+      <div class="stat">Layer: <span id="layer">Surface</span></div>
+      <div class="stat">Chunk: <span id="chunk">(0,0)</span></div>
+      <div class="stat">Pos: <span id="pos">(0,0)</span></div>
+      <div class="stat">Near entrance: <span id="near">No</span></div>
+    </div>
+    <div class="row note" id="note"></div>
+  </div>
+
+  <canvas id="game" width="1280" height="720"></canvas>
+
+  <div id="footer">
+    <span>2 layers • chunk streaming • multiple entrance transition styles • browser-only (no deps)</span>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>
