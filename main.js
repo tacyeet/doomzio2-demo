@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  // ===== Canvas setup =====
+  // ===== Canvas =====
   const canvas = document.getElementById('game');
   const ctx = canvas.getContext('2d', { alpha: false });
 
@@ -11,32 +11,55 @@
     canvas.height = Math.floor(window.innerHeight * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
-  window.addEventListener('resize', resize);
+  addEventListener('resize', resize);
   resize();
 
-  // ===== World constants =====
-  const TILE = 24;                 // pixels per tile
-  const CHUNK_TILES = 16;          // chunk is CHUNK_TILES x CHUNK_TILES tiles
+  // ===== Constants =====
+  const TILE = 24;
+  const CHUNK_TILES = 16;
   const CHUNK_PX = TILE * CHUNK_TILES;
 
-  const WORLD_CHUNKS_W = 12;
-  const WORLD_CHUNKS_H = 12;
+  const WORLD_CHUNKS_W = 12, WORLD_CHUNKS_H = 12;
   const WORLD_W = WORLD_CHUNKS_W * CHUNK_PX;
   const WORLD_H = WORLD_CHUNKS_H * CHUNK_PX;
 
-  // Two layers
-  const LAYER_SURFACE = 0;
-  const LAYER_CAVE = 1;
+  const LAYER0 = 0; // surface
+  const LAYER1 = 1; // cave
+  const LAYER2 = 2; // deep
+  const LAYER_NAMES = ['Surface', 'Cave', 'Deep'];
+
+  // local +Y is "into entrance"
+  const DIRS = [
+    { name: 'Down',  dx: 0,  dy:  1, ang: 0 },
+    { name: 'Right', dx: 1,  dy:  0, ang: -Math.PI / 2 },
+    { name: 'Up',    dx: 0,  dy: -1, ang: Math.PI },
+    { name: 'Left',  dx: -1, dy:  0, ang: Math.PI / 2 },
+  ];
+
+  // ===== UI =====
+  const layerBadge = document.getElementById('layerBadge');
+  const entranceInfo = document.getElementById('entranceInfo');
+  function setLayerUI(layer) {
+    if (!layerBadge) return;
+    layerBadge.textContent = `Layer: ${LAYER_NAMES[layer] ?? layer}`;
+  }
 
   // ===== Input =====
   const keys = new Set();
-  window.addEventListener('keydown', (e) => {
-    keys.add(e.key.toLowerCase());
-    if (e.key.toLowerCase() === 'f') debug = !debug;
+  let debug = false;
+  addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    keys.add(k);
+    if (k === 'f') debug = !debug;
   });
-  window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
+  addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
 
-  // ===== Deterministic RNG helpers =====
+  // ===== Math =====
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeInOut = (t) => (t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2)/2);
+
+  // ===== Deterministic random =====
   function hash32(x, y, layer) {
     let h = 2166136261 >>> 0;
     h ^= (x * 374761393) >>> 0; h = Math.imul(h, 16777619) >>> 0;
@@ -49,116 +72,107 @@
     let x = seed >>> 0;
     x ^= x << 13; x >>>= 0;
     x ^= x >>> 17; x >>>= 0;
-    x ^= x << 5; x >>>= 0;
+    x ^= x << 5;  x >>>= 0;
     return (x >>> 0) / 4294967296;
   }
-  function smoothstep(t) { return t * t * (3 - 2 * t); }
 
-  // Smooth-ish 2D value noise (cheap, deterministic)
-  function valueNoise2D(x, y, layer, freq) {
-    const fx = x / freq;
-    const fy = y / freq;
-    const x0 = Math.floor(fx), y0 = Math.floor(fy);
-    const x1 = x0 + 1, y1 = y0 + 1;
-    const tx = smoothstep(fx - x0);
-    const ty = smoothstep(fy - y0);
-
-    const a = rand01(hash32(x0, y0, layer) ^ 0xA3C59AC3);
-    const b = rand01(hash32(x1, y0, layer) ^ 0xA3C59AC3);
-    const c = rand01(hash32(x0, y1, layer) ^ 0xA3C59AC3);
-    const d = rand01(hash32(x1, y1, layer) ^ 0xA3C59AC3);
-
-    const ab = a + (b - a) * tx;
-    const cd = c + (d - c) * tx;
-    return ab + (cd - ab) * ty; // 0..1
+  // ===== Rounded rect (subpath; no beginPath) =====
+  function roundRectSubPath(x, y, w, h, r) {
+    const rr = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
   }
 
-  // Small helper to shade a hex color
+  // ===== Terrain shading =====
+  function baseTileColor(layer, v) {
+    if (layer === LAYER0) return (v === 0 ? '#18402a' : (v === 1 ? '#4b4f57' : '#23563a'));
+    if (layer === LAYER1) return (v === 0 ? '#141724' : (v === 1 ? '#3a3f4c' : '#23283a'));
+    return (v === 0 ? '#1a1117' : (v === 1 ? '#4a3b46' : '#2a1d27'));
+  }
   function shadeHex(hex, amt) {
-    // amt in [-1..1], shifts brightness
     const s = hex.startsWith('#') ? hex.slice(1) : hex;
     const r = parseInt(s.slice(0, 2), 16);
     const g = parseInt(s.slice(2, 4), 16);
     const b = parseInt(s.slice(4, 6), 16);
-
-    const k = Math.round(amt * 38); // brightness scale
+    const k = Math.round(amt * 35);
     const nr = Math.max(0, Math.min(255, r + k));
     const ng = Math.max(0, Math.min(255, g + k));
     const nb = Math.max(0, Math.min(255, b + k));
-
     const toHex = (v) => v.toString(16).padStart(2, '0');
     return `#${toHex(nr)}${toHex(ng)}${toHex(nb)}`;
   }
-
-  // ===== Chunk cache (LRU-ish) =====
-  const MAX_CHUNKS = 220;
-  const chunkCache = new Map(); // key => {tiles, entrances}
-  const chunkUse = new Map();   // key => lastUsedTime
-  function chunkKey(layer, cx, cy) { return `${layer}:${cx}:${cy}`; }
-
-  function getChunk(layer, cx, cy, t) {
-    const key = chunkKey(layer, cx, cy);
-    if (chunkCache.has(key)) {
-      chunkUse.set(key, t);
-      return chunkCache.get(key);
-    }
-    const chunk = genChunk(layer, cx, cy);
-    chunkCache.set(key, chunk);
-    chunkUse.set(key, t);
-
-    if (chunkCache.size > MAX_CHUNKS) {
-      // evict least recently used (prefer to evict non-current layer)
-      let oldestKey = null;
-      let oldestT = Infinity;
-      for (const [k, last] of chunkUse.entries()) {
-        if (last < oldestT) { oldestT = last; oldestKey = k; }
-      }
-      if (oldestKey && !oldestKey.startsWith(currentLayer + ':')) {
-        chunkCache.delete(oldestKey);
-        chunkUse.delete(oldestKey);
-      }
-    }
-    return chunk;
+  function noise(wx, wy, layer) {
+    const a = rand01(hash32(wx, wy, layer));
+    const b = rand01(hash32(wx + 17, wy - 9, layer));
+    return (a * 0.7 + b * 0.3);
   }
 
-  // ===== Entrance directions =====
-  const DIRS = [
-    { name: 'Down',  dx: 0, dy:  1, ang: Math.PI / 2 },
-    { name: 'Right', dx: 1, dy:  0, ang: 0 },
-    { name: 'Up',    dx: 0, dy: -1, ang: -Math.PI / 2 },
-    { name: 'Left',  dx: -1,dy:  0, ang: Math.PI },
-  ];
+  // ===== Chunk cache: bake each chunk once =====
+  const chunkCache = new Map(); // key -> { img, entrances: [] }
+  const chunkUse = new Map();
+  const MAX_CHUNKS = 340;
+  const chunkKey = (layer, cx, cy) => `${layer}:${cx}:${cy}`;
 
-  // ===== Chunk generation =====
+  // Portal placement:
+  // - 0<->1 portals: even-even chunks where parity == 0
+  // - 1<->2 portals: even-even chunks where parity == 1 (offset ~2 chunks) => no overlap
+  function portalTypeFor(layer, cx, cy) {
+    if ((cx & 1) || (cy & 1)) return null; // only even-even
+    const parity = ((cx >> 1) + (cy >> 1)) & 1;
+
+    if (layer === LAYER0) return 0;
+    if (layer === LAYER2) return 1;
+    return parity; // layer1: parity=0 connects to L0, parity=1 connects to L2
+  }
+
   function genChunk(layer, cx, cy) {
-    const tiles = new Uint8Array(CHUNK_TILES * CHUNK_TILES);
+    const off = document.createElement('canvas');
+    off.width = CHUNK_PX;
+    off.height = CHUNK_PX;
+    const g = off.getContext('2d', { alpha: false });
+
     const baseSeed = hash32(cx, cy, layer);
 
     for (let ty = 0; ty < CHUNK_TILES; ty++) {
       for (let tx = 0; tx < CHUNK_TILES; tx++) {
         const wx = cx * CHUNK_TILES + tx;
         const wy = cy * CHUNK_TILES + ty;
-        const s = hash32(wx, wy, layer) ^ baseSeed;
-        const r = rand01(s);
 
+        const r = rand01(hash32(wx, wy, layer) ^ baseSeed);
         let v = 0;
-        // sprinkle obstacles
-        if (r < 0.08) v = 1;        // rock
-        else if (r < 0.14) v = 2;   // shrub/rubble
-        tiles[ty * CHUNK_TILES + tx] = v;
+        if (r < 0.08) v = 1;
+        else if (r < 0.14) v = 2;
+
+        const base = baseTileColor(layer, v);
+        const n = noise(wx, wy, layer) - 0.52;
+        const shaded = shadeHex(base, n * 0.7);
+
+        g.fillStyle = shaded;
+        g.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+
+        if (v !== 0) {
+          g.globalAlpha = 0.75;
+          g.fillStyle = (layer === LAYER0)
+            ? (v === 1 ? '#2b2f36' : '#173322')
+            : (layer === LAYER1)
+              ? (v === 1 ? '#1d2028' : '#141724')
+              : (v === 1 ? '#211820' : '#140c12');
+          g.fillRect(tx * TILE + 4, ty * TILE + 4, TILE - 8, TILE - 8);
+          g.globalAlpha = 1;
+        }
       }
     }
 
-    // Entrances: every 4 chunks, but now placed on chunk edges (not center)
     const entrances = [];
-    if (cx % 4 === 0 && cy % 4 === 0) {
-      const idx = ((cx / 4) + (cy / 4) * 9999) & 3;
+    const pType = portalTypeFor(layer, cx, cy);
+    if (pType !== null) {
+      const idx = ((cx * 131) ^ (cy * 197) ^ (layer * 911)) & 3;
       const dir = DIRS[idx];
 
-      // Style cycles A/B/C/D
-      const style = idx & 3;
-
-      // Place mouth on the chunk EDGE in the dir direction
       const pad = TILE * 1.35;
       let ex = cx * CHUNK_PX + CHUNK_PX / 2;
       let ey = cy * CHUNK_PX + CHUNK_PX / 2;
@@ -168,317 +182,144 @@
       if (dir.name === 'Right') ex = cx * CHUNK_PX + (CHUNK_PX - pad);
       if (dir.name === 'Left')  ex = cx * CHUNK_PX + pad;
 
-      const mouthW = TILE * 3.4;
-      const mouthH = TILE * 1.9;
-      const depth = TILE * 3.2;
+      let toLayer = layer;
+      if (layer === LAYER0) toLayer = LAYER1;
+      else if (layer === LAYER2) toLayer = LAYER1;
+      else toLayer = (pType === 0) ? LAYER0 : LAYER2;
 
       entrances.push({
-        id: `${cx},${cy},${style}`,
+        id: `${layer}:${cx}:${cy}:${pType}`,
         layer,
-        toLayer: (layer === LAYER_SURFACE ? LAYER_CAVE : LAYER_SURFACE),
-        cx, cy,
-        x: ex,
-        y: ey,
+        toLayer,
+        x: ex, y: ey,
         dir,
-        style,
-        mouthW,
-        mouthH,
-        depth,
+        mouthW: TILE * 3.4,
+        mouthH: TILE * 1.9,
+        depth:  TILE * 3.2,
+        pType
       });
     }
 
-    return { tiles, entrances };
+    return { img: off, entrances };
   }
 
-  // ===== Player =====
-  const player = {
-    x: WORLD_W / 2,
-    y: WORLD_H / 2,
-    r: 10,
-    speed: 170,
-    sprintMul: 1.45,
-  };
+  function getChunk(layer, cx, cy, now) {
+    const key = chunkKey(layer, cx, cy);
+    const hit = chunkCache.get(key);
+    if (hit) { chunkUse.set(key, now); return hit; }
 
-  let currentLayer = LAYER_SURFACE;
+    const ch = genChunk(layer, cx, cy);
+    chunkCache.set(key, ch);
+    chunkUse.set(key, now);
 
-  // ===== Transition state =====
-  let transitioning = false;
-  let trans = {
-    entrance: null,
-    progress: 0,
-    duration: 0.60,
-    fromLayer: 0,
-    toLayer: 1,
-    carryDx: 0,
-    carryDy: 0,
-    swapped: false
-  };
+    if (chunkCache.size > MAX_CHUNKS) {
+      let oldestKey = null, oldestT = Infinity;
+      for (const [k, last] of chunkUse.entries()) {
+        if (last < oldestT) { oldestT = last; oldestKey = k; }
+      }
+      if (oldestKey) { chunkCache.delete(oldestKey); chunkUse.delete(oldestKey); }
+    }
+    return ch;
+  }
 
-  // ===== Debug =====
-  let debug = false;
+  // ===== Player & camera =====
+  const player = { x: WORLD_W / 2, y: WORLD_H / 2, r: 10, speed: 190, sprintMul: 1.45 };
+  let currentLayer = LAYER0;
+  setLayerUI(currentLayer);
 
-  // ===== Camera =====
   const cam = { x: player.x, y: player.y, smooth: 0.12 };
-  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-
   function worldClamp() {
     player.x = clamp(player.x, 0, WORLD_W);
     player.y = clamp(player.y, 0, WORLD_H);
   }
 
-  // ===== Entrances =====
-  function getNearbyEntrances(layer, t) {
-    const cx = Math.floor(player.x / CHUNK_PX);
-    const cy = Math.floor(player.y / CHUNK_PX);
-    const out = [];
-    for (let oy = -1; oy <= 1; oy++) {
-      for (let ox = -1; ox <= 1; ox++) {
-        const nx = cx + ox, ny = cy + oy;
-        if (nx < 0 || ny < 0 || nx >= WORLD_CHUNKS_W || ny >= WORLD_CHUNKS_H) continue;
-        const ch = getChunk(layer, nx, ny, t);
-        for (const e of ch.entrances) out.push(e);
-      }
-    }
-    return out;
+  // ===== Render layer (baked chunks) =====
+  function chunkRangeForRect(camX, camY, rect) {
+    const wx0 = camX + rect.x;
+    const wy0 = camY + rect.y;
+    const wx1 = camX + rect.x + rect.w;
+    const wy1 = camY + rect.y + rect.h;
+
+    const minCX = clamp(Math.floor(wx0 / CHUNK_PX) - 1, 0, WORLD_CHUNKS_W - 1);
+    const maxCX = clamp(Math.floor(wx1 / CHUNK_PX) + 1, 0, WORLD_CHUNKS_W - 1);
+    const minCY = clamp(Math.floor(wy0 / CHUNK_PX) - 1, 0, WORLD_CHUNKS_H - 1);
+    const maxCY = clamp(Math.floor(wy1 / CHUNK_PX) + 1, 0, WORLD_CHUNKS_H - 1);
+    return { minCX, maxCX, minCY, maxCY };
   }
 
-  function pointInOrientedMouth(px, py, e) {
-    // Transform point into entrance local space aligned with dir.
-    const ang = e.dir.ang;
-    const cos = Math.cos(-ang), sin = Math.sin(-ang);
-    const lx = (px - e.x) * cos - (py - e.y) * sin;
-    const ly = (px - e.x) * sin + (py - e.y) * cos;
-    return (Math.abs(lx) <= e.mouthW / 2) && (Math.abs(ly) <= e.mouthH / 2);
-  }
+  function renderLayer(layer, now, camX, camY, clipRect /*screen rect or null*/) {
+    const w = innerWidth, h = innerHeight;
 
-  function isApproachingEntrance(e, mvx, mvy) {
-    const mLen = Math.hypot(mvx, mvy);
-    if (mLen < 0.01) return false;
-    const mx = mvx / mLen, my = mvy / mLen;
-    const dot = mx * e.dir.dx + my * e.dir.dy;
-    return dot > 0.45; // tighter cone now that entrances are directional
-  }
-
-  function maybeStartTransition(entrances, mvx, mvy) {
-    if (transitioning) return null;
-    for (const e of entrances) {
-      if (pointInOrientedMouth(player.x, player.y, e) && isApproachingEntrance(e, mvx, mvy)) {
-        transitioning = true;
-        trans.entrance = e;
-        trans.progress = 0;
-        trans.duration = 0.60;
-        trans.fromLayer = currentLayer;
-        trans.toLayer = e.toLayer;
-        trans.carryDx = e.dir.dx;
-        trans.carryDy = e.dir.dy;
-        trans.swapped = false;
-        return e;
-      }
-    }
-    return null;
-  }
-
-  // ===== UI =====
-  const layerBadge = document.getElementById('layerBadge');
-  const entranceInfo = document.getElementById('entranceInfo');
-  function setLayerUI() {
-    layerBadge.textContent = `Layer: ${currentLayer === LAYER_SURFACE ? 'Surface' : 'Cave'}`;
-  }
-  setLayerUI();
-
-  // ===== Rendering helpers =====
-  function roundRectFill(x, y, w, h, r) {
-    const rr = Math.min(r, w / 2, h / 2);
-    ctx.beginPath();
-    ctx.moveTo(x + rr, y);
-    ctx.arcTo(x + w, y, x + w, y + h, rr);
-    ctx.arcTo(x + w, y + h, x, y + h, rr);
-    ctx.arcTo(x, y + h, x, y, rr);
-    ctx.arcTo(x, y, x + w, y, rr);
-    ctx.closePath();
-    ctx.fill();
-  }
-
-  // World-anchored grid (fixes “grid stuck to player”)
-  function drawWorldGrid(camX, camY, w, h, stepPx, alpha) {
     ctx.save();
-    ctx.globalAlpha = alpha;
-
-    const startX = Math.floor(camX / stepPx) * stepPx;
-    const startY = Math.floor(camY / stepPx) * stepPx;
-
-    ctx.beginPath();
-    for (let x = startX; x <= camX + w; x += stepPx) {
-      const sx = x - camX;
-      ctx.moveTo(sx, 0);
-      ctx.lineTo(sx, h);
+    if (clipRect) {
+      ctx.beginPath();
+      roundRectSubPath(clipRect.x, clipRect.y, clipRect.w, clipRect.h, clipRect.r || 0);
+      ctx.clip();
     }
-    for (let y = startY; y <= camY + h; y += stepPx) {
-      const sy = y - camY;
-      ctx.moveTo(0, sy);
-      ctx.lineTo(w, sy);
+
+    let minCX, maxCX, minCY, maxCY;
+    if (clipRect) {
+      ({ minCX, maxCX, minCY, maxCY } = chunkRangeForRect(camX, camY, clipRect));
+    } else {
+      minCX = clamp(Math.floor((camX - CHUNK_PX) / CHUNK_PX), 0, WORLD_CHUNKS_W - 1);
+      maxCX = clamp(Math.floor((camX + w + CHUNK_PX) / CHUNK_PX), 0, WORLD_CHUNKS_W - 1);
+      minCY = clamp(Math.floor((camY - CHUNK_PX) / CHUNK_PX), 0, WORLD_CHUNKS_H - 1);
+      maxCY = clamp(Math.floor((camY + h + CHUNK_PX) / CHUNK_PX), 0, WORLD_CHUNKS_H - 1);
     }
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 1;
-    ctx.stroke();
+
+    for (let cy = minCY; cy <= maxCY; cy++) {
+      for (let cx = minCX; cx <= maxCX; cx++) {
+        const ch = getChunk(layer, cx, cy, now);
+        const ox = cx * CHUNK_PX - camX;
+        const oy = cy * CHUNK_PX - camY;
+        ctx.drawImage(ch.img, ox, oy);
+
+        if (debug) {
+          ctx.save();
+          ctx.globalAlpha = 0.25;
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(ox, oy, CHUNK_PX, CHUNK_PX);
+          ctx.globalAlpha = 0.95;
+          ctx.fillStyle = '#fff';
+          ctx.font = '12px ui-sans-serif,system-ui';
+          ctx.fillText(`${cx},${cy}`, ox + 6, oy + 14);
+          ctx.restore();
+        }
+      }
+    }
+
     ctx.restore();
   }
 
-  // Terrain palette
-  function baseTileColor(layer, v) {
-    if (layer === LAYER_SURFACE) {
-      if (v === 0) return '#18402a'; // grass base
-      if (v === 1) return '#4b4f57'; // rock
-      return '#23563a';              // shrub
-    } else {
-      if (v === 0) return '#141724'; // cave floor
-      if (v === 1) return '#3a3f4c'; // cave rock
-      return '#23283a';              // rubble
-    }
-  }
+  // ===== Portal rendering (preview) =====
+  function renderOtherLayerInPortal(e, now, camX, camY) {
+    const w = innerWidth, h = innerHeight;
 
-  // Draw a tile with sub-square micro variation + smooth noise shading
-  function drawTile(layer, wxTile, wyTile, screenX, screenY, v) {
-    const base = baseTileColor(layer, v);
-
-    // Large-scale smooth variation
-    const n1 = valueNoise2D(wxTile, wyTile, layer ^ 17, 7.5); // 0..1
-    const n2 = valueNoise2D(wxTile, wyTile, layer ^ 77, 18.0); // 0..1
-    const shade = (n1 * 0.65 + n2 * 0.35) - 0.52; // ~[-0.5..0.5]
-    const shaded = shadeHex(base, shade * 0.55);
-
-    // Fill base tile
-    ctx.fillStyle = shaded;
-    ctx.fillRect(screenX, screenY, TILE, TILE);
-
-    // Sub-square micro pattern (2x2)
-    const half = TILE / 2;
-    const microA = rand01(hash32(wxTile * 3 + 11, wyTile * 3 + 7, layer) ^ 0x55AA);
-    const microB = rand01(hash32(wxTile * 3 + 19, wyTile * 3 + 3, layer) ^ 0xAA55);
-    const microC = rand01(hash32(wxTile * 3 + 5, wyTile * 3 + 17, layer) ^ 0xCC33);
-    const microD = rand01(hash32(wxTile * 3 + 23, wyTile * 3 + 29, layer) ^ 0x33CC);
-
-    const m = (u) => (u - 0.5) * 0.22; // small variation amount
-    ctx.globalAlpha = 0.55;
-    ctx.fillStyle = shadeHex(shaded, m(microA));
-    ctx.fillRect(screenX, screenY, half, half);
-    ctx.fillStyle = shadeHex(shaded, m(microB));
-    ctx.fillRect(screenX + half, screenY, half, half);
-    ctx.fillStyle = shadeHex(shaded, m(microC));
-    ctx.fillRect(screenX, screenY + half, half, half);
-    ctx.fillStyle = shadeHex(shaded, m(microD));
-    ctx.fillRect(screenX + half, screenY + half, half, half);
-    ctx.globalAlpha = 1;
-
-    // If obstacle, add a simple glyph so it reads
-    if (v !== 0) {
-      ctx.save();
-      ctx.globalAlpha = 0.75;
-      ctx.fillStyle = (layer === LAYER_SURFACE)
-        ? (v === 1 ? '#2b2f36' : '#173322')
-        : (v === 1 ? '#1d2028' : '#141724');
-      const pad = 4;
-      roundRectFill(screenX + pad, screenY + pad, TILE - pad * 2, TILE - pad * 2, 4);
-      ctx.restore();
-    }
-  }
-
-  // Draw a "mirror window" preview of the other layer inside the entrance mouth
-  function drawMirrorPreview(e, camX, camY) {
-    const w = window.innerWidth;
-    const h = window.innerHeight;
-
-    // Screen position
     const sx = e.x - camX;
     const sy = e.y - camY;
 
-    // Clip to the mouth shape in screen space
     ctx.save();
     ctx.translate(sx, sy);
     ctx.rotate(e.dir.ang);
 
-    // mouth rect local coords
-    const mw = e.mouthW;
-    const mh = e.mouthH;
-
-    // Clip region
     ctx.beginPath();
-    const r = 10;
-    const x = -mw / 2, y = -mh / 2;
-    ctx.moveTo(x + r, y);
-    ctx.arcTo(x + mw, y, x + mw, y + mh, r);
-    ctx.arcTo(x + mw, y + mh, x, y + mh, r);
-    ctx.arcTo(x, y + mh, x, y, r);
-    ctx.arcTo(x, y, x + mw, y, r);
-    ctx.closePath();
+    roundRectSubPath(-e.mouthW/2, -e.mouthH/2, e.mouthW, e.mouthH, 12);
     ctx.clip();
 
-    // Parallax shift so it reads as "depth"
-    const par = TILE * 0.9;
-    const shiftX = e.dir.dx * par;
-    const shiftY = e.dir.dy * par;
+    // Undo transform: draw in screen coords
+    ctx.rotate(-e.dir.ang);
+    ctx.translate(-sx, -sy);
 
-    // We will render the other layer tiles behind this mouth in a small area
-    const toLayer = e.toLayer;
-
-    // Determine world-space rect to sample
-    // We sample a small rectangle centered at entrance, shifted "forward"
-    const sampleCenterX = e.x + shiftX;
-    const sampleCenterY = e.y + shiftY;
-
-    // Draw tile samples at the mouth scale (no need for perfect perspective)
-    const sampleTilesX = 6;
-    const sampleTilesY = 4;
-
-    const startWX = Math.floor((sampleCenterX - (sampleTilesX * TILE) / 2) / TILE);
-    const startWY = Math.floor((sampleCenterY - (sampleTilesY * TILE) / 2) / TILE);
-
-    // Fill with other-layer terrain
-    for (let iy = 0; iy < sampleTilesY; iy++) {
-      for (let ix = 0; ix < sampleTilesX; ix++) {
-        const wxTile = startWX + ix;
-        const wyTile = startWY + iy;
-
-        // Convert world tile -> chunk -> local tile
-        const ccx = Math.floor((wxTile * TILE) / CHUNK_PX);
-        const ccy = Math.floor((wyTile * TILE) / CHUNK_PX);
-        if (ccx < 0 || ccy < 0 || ccx >= WORLD_CHUNKS_W || ccy >= WORLD_CHUNKS_H) continue;
-
-        const ch = getChunk(toLayer, ccx, ccy, performance.now());
-        const localTx = wxTile - ccx * CHUNK_TILES;
-        const localTy = wyTile - ccy * CHUNK_TILES;
-        if (localTx < 0 || localTy < 0 || localTx >= CHUNK_TILES || localTy >= CHUNK_TILES) continue;
-
-        const v = ch.tiles[localTy * CHUNK_TILES + localTx];
-
-        // draw into mouth local coords (centered)
-        const dx = (-mw / 2) + (ix / sampleTilesX) * mw;
-        const dy = (-mh / 2) + (iy / sampleTilesY) * mh;
-        const tw = mw / sampleTilesX;
-        const th = mh / sampleTilesY;
-
-        const base = baseTileColor(toLayer, v);
-        const n = valueNoise2D(wxTile, wyTile, toLayer ^ 33, 11);
-        const shaded = shadeHex(base, (n - 0.52) * 0.45);
-
-        ctx.fillStyle = shaded;
-        ctx.fillRect(dx, dy, tw + 0.5, th + 0.5);
-      }
-    }
-
-    // Add a faint "glass" sheen to sell mirror
-    ctx.globalAlpha = 0.14;
-    ctx.fillStyle = '#a5f3fc';
-    ctx.fillRect(-mw / 2, -mh / 2, mw, mh);
-    ctx.globalAlpha = 1;
+    const portalCamX = player.x - w / 2;
+    const portalCamY = player.y - h / 2;
+    renderLayer(e.toLayer, now, portalCamX, portalCamY, null);
 
     ctx.restore();
   }
 
-  function drawEntrance(e, camX, camY) {
-    // Mirror preview first (so rim draws over it)
-    drawMirrorPreview(e, camX, camY);
-
+  // ===== Entrance drawing =====
+  function drawEntranceRimAndArrow(e, camX, camY) {
     const sx = e.x - camX;
     const sy = e.y - camY;
 
@@ -488,105 +329,117 @@
 
     const w = e.mouthW, h = e.mouthH;
 
-    // Rim / mouth visuals
-    if (e.style === 0) {
-      // A: Hole with lip
-      ctx.fillStyle = '#2b2a26';
-      roundRectFill(-w / 2 - 8, -h / 2 - 8, w + 16, h + 16, 12);
-      const g = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
-      g.addColorStop(0, '#0b0c0f');
-      g.addColorStop(1, '#000000');
-      ctx.fillStyle = g;
-      roundRectFill(-w / 2, -h / 2, w, h, 10);
+    ctx.fillStyle = (e.pType === 0) ? '#2b2a26' : '#262b2a';
+    ctx.beginPath();
+    roundRectSubPath(-w/2 - 10, -h/2 - 10, w + 20, h + 20, 14);
+    roundRectSubPath(-w/2,      -h/2,      w,      h,      12);
+    ctx.fill('evenodd');
 
-      ctx.globalAlpha = 0.35;
-      ctx.fillStyle = '#ffffff';
-      roundRectFill(-w / 2 - 8, -h / 2 - 8, w + 16, 7, 12);
-      ctx.globalAlpha = 1;
-    } else if (e.style === 1) {
-      // B: Ramp / steps
-      ctx.fillStyle = '#2a2e3a';
-      for (let i = 0; i < 6; i++) {
-        const t = i / 6;
-        const ww = w * (1 - 0.18 * t);
-        const yy = -h / 2 + t * h;
-        ctx.globalAlpha = 0.95 - 0.12 * i;
-        roundRectFill(-ww / 2, yy, ww, h / 6 + 1, 6);
-      }
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = '#0b0c0f';
-      roundRectFill(-w * 0.38, -h / 2 + h * 0.55, w * 0.76, h * 0.42, 8);
-    } else if (e.style === 2) {
-      // C: Arch mouth / overhang
-      ctx.fillStyle = '#2b2a26';
-      roundRectFill(-w / 2 - 10, -h / 2 - 12, w + 20, h + 24, 16);
-      ctx.fillStyle = '#0b0c0f';
-      roundRectFill(-w / 2, -h / 2, w, h, 12);
-
-      // Overhang band
-      ctx.fillStyle = '#1b1a17';
-      ctx.globalAlpha = 0.85;
-      roundRectFill(-w / 2 - 10, -h / 2 - 12, w + 20, 14, 16);
-      ctx.globalAlpha = 1;
-    } else {
-      // D: Rune rim (fantasy)
-      ctx.fillStyle = '#1b1a17';
-      roundRectFill(-w / 2 - 9, -h / 2 - 9, w + 18, h + 18, 14);
-      ctx.fillStyle = '#050608';
-      roundRectFill(-w / 2, -h / 2, w, h, 12);
-
-      ctx.globalAlpha = 0.65;
-      ctx.strokeStyle = '#7dd3fc';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(0, 0, Math.min(w, h) * 0.44, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-    }
-
-    // Shadow behind lip to sell depth (always)
-    ctx.globalAlpha = 0.22;
-    ctx.fillStyle = '#000';
-    roundRectFill(-w / 2, h / 2 + 6, w, 8, 6);
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    roundRectSubPath(-w/2, -h/2, w, h, 12);
+    ctx.stroke();
     ctx.globalAlpha = 1;
 
-    // Entry arrow (shows which side to walk in from)
-    // Arrow sits outside the mouth on the "front" side and points inward
     const arrowDist = h / 2 + 22;
     ctx.save();
-    ctx.translate(0, -arrowDist);  // front side in local space is negative Y
+    ctx.translate(0, -arrowDist);
+
     ctx.globalAlpha = 0.95;
     ctx.fillStyle = '#ffffff';
     ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(-10, -14);
-    ctx.lineTo(10, -14);
+    ctx.moveTo(0, 16);
+    ctx.lineTo(-11, -2);
+    ctx.lineTo(11, -2);
     ctx.closePath();
     ctx.fill();
 
     ctx.globalAlpha = 0.9;
     ctx.fillStyle = '#111827';
     ctx.beginPath();
-    ctx.moveTo(0, -3);
-    ctx.lineTo(-6, -12);
-    ctx.lineTo(6, -12);
+    ctx.moveTo(0, 12);
+    ctx.lineTo(-7, 0);
+    ctx.lineTo(7, 0);
     ctx.closePath();
     ctx.fill();
-    ctx.restore();
 
+    ctx.restore();
     ctx.restore();
   }
 
-  function drawVignette(amount) {
-    const w = window.innerWidth, h = window.innerHeight;
-    ctx.save();
-    ctx.globalAlpha = amount;
-    const g = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.15, w / 2, h / 2, Math.max(w, h) * 0.65);
-    g.addColorStop(0, 'rgba(0,0,0,0)');
-    g.addColorStop(1, 'rgba(0,0,0,0.85)');
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, w, h);
-    ctx.restore();
+  // Transition rect start: AABB around rotated mouth (good enough)
+  function portalStartRectScreen(e, camX, camY) {
+    const sx = e.x - camX;
+    const sy = e.y - camY;
+
+    const pw = e.mouthW;
+    const ph = e.mouthH;
+    const ang = e.dir.ang;
+    const c = Math.abs(Math.cos(ang));
+    const s = Math.abs(Math.sin(ang));
+    const aw = pw * c + ph * s;
+    const ah = pw * s + ph * c;
+
+    return { x: sx - aw/2, y: sy - ah/2, w: aw, h: ah, r: 10 };
+  }
+
+  function lerpRect(a, b, t) {
+    return {
+      x: lerp(a.x, b.x, t),
+      y: lerp(a.y, b.y, t),
+      w: lerp(a.w, b.w, t),
+      h: lerp(a.h, b.h, t),
+      r: lerp(a.r || 0, b.r || 0, t),
+    };
+  }
+
+  // ===== Transition =====
+  let transitioning = false;
+  const trans = {
+    entrance: null,
+    progress: 0,
+    duration: 0.30,
+  };
+
+  function pointInOrientedMouth(px, py, e) {
+    const ang = e.dir.ang;
+    const cos = Math.cos(-ang), sin = Math.sin(-ang);
+    const lx = (px - e.x) * cos - (py - e.y) * sin;
+    const ly = (px - e.x) * sin + (py - e.y) * cos;
+    return (Math.abs(lx) <= e.mouthW / 2) && (Math.abs(ly) <= e.mouthH / 2);
+  }
+  function movingInto(e, mvx, mvy) {
+    const mLen = Math.hypot(mvx, mvy);
+    if (mLen < 0.01) return false;
+    const mx = mvx / mLen, my = mvy / mLen;
+    return (mx * e.dir.dx + my * e.dir.dy) > 0.35;
+  }
+
+  function getNearbyEntrances(layer, now) {
+    const cx = Math.floor(player.x / CHUNK_PX);
+    const cy = Math.floor(player.y / CHUNK_PX);
+    const out = [];
+    for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+      const nx = cx + ox, ny = cy + oy;
+      if (nx < 0 || ny < 0 || nx >= WORLD_CHUNKS_W || ny >= WORLD_CHUNKS_H) continue;
+      const ch = getChunk(layer, nx, ny, now);
+      for (const e of ch.entrances) out.push(e);
+    }
+    return out;
+  }
+
+  function tryStartTransition(entrances, mvx, mvy) {
+    if (transitioning) return;
+    for (const e of entrances) {
+      if (pointInOrientedMouth(player.x, player.y, e) && movingInto(e, mvx, mvy)) {
+        transitioning = true;
+        trans.entrance = e;
+        trans.progress = 0;
+        break;
+      }
+    }
   }
 
   // ===== Main loop =====
@@ -595,23 +448,19 @@
     const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
 
-    // Input movement
     let ax = 0, ay = 0;
     if (keys.has('w')) ay -= 1;
     if (keys.has('s')) ay += 1;
     if (keys.has('a')) ax -= 1;
     if (keys.has('d')) ax += 1;
 
-    const len = Math.hypot(ax, ay) || 1;
-    ax /= len; ay /= len;
+    const l = Math.hypot(ax, ay) || 1;
+    ax /= l; ay /= l;
 
     const sprint = keys.has('shift');
     const speed = player.speed * (sprint ? player.sprintMul : 1);
-
     const mvx = ax * speed;
     const mvy = ay * speed;
-
-    let vignette = 0;
 
     if (!transitioning) {
       player.x += mvx * dt;
@@ -622,98 +471,61 @@
       trans.progress += dt / trans.duration;
       const p = clamp(trans.progress, 0, 1);
 
-      // Swap at midpoint (feels like you're inside)
-      if (!trans.swapped && p >= 0.52) {
-        currentLayer = trans.toLayer;
-        setLayerUI();
-        trans.swapped = true;
-      }
-
-      // Carry forward down the entrance direction (so it feels like walking into it)
-      const carrySpeed = (e.depth / trans.duration);
-      player.x += trans.carryDx * carrySpeed * dt + mvx * dt * 0.12;
-      player.y += trans.carryDy * carrySpeed * dt + mvy * dt * 0.12;
+      const push = (e.depth / trans.duration);
+      player.x += e.dir.dx * push * dt + mvx * dt * 0.08;
+      player.y += e.dir.dy * push * dt + mvy * dt * 0.08;
       worldClamp();
 
-      vignette = Math.sin(p * Math.PI) * 0.60;
-
       if (p >= 1) {
+        currentLayer = e.toLayer;
+        setLayerUI(currentLayer);
         transitioning = false;
         trans.entrance = null;
       }
     }
 
-    // Camera follow
     cam.x += (player.x - cam.x) * cam.smooth;
     cam.y += (player.y - cam.y) * cam.smooth;
 
-    render(now, vignette, mvx, mvy);
+    render(now, mvx, mvy);
     requestAnimationFrame(tick);
   }
 
-  function render(t, vignette, mvx, mvy) {
-    const w = window.innerWidth;
-    const h = window.innerHeight;
-
-    // Background clear
-    ctx.fillStyle = (currentLayer === LAYER_SURFACE) ? '#0b2417' : '#070912';
-    ctx.fillRect(0, 0, w, h);
-
+  function render(now, mvx, mvy) {
+    const w = innerWidth, h = innerHeight;
     const camX = cam.x - w / 2;
     const camY = cam.y - h / 2;
 
-    // Visible chunk range (+ margin)
-    const minCX = clamp(Math.floor((camX - CHUNK_PX) / CHUNK_PX), 0, WORLD_CHUNKS_W - 1);
-    const maxCX = clamp(Math.floor((camX + w + CHUNK_PX) / CHUNK_PX), 0, WORLD_CHUNKS_W - 1);
-    const minCY = clamp(Math.floor((camY - CHUNK_PX) / CHUNK_PX), 0, WORLD_CHUNKS_H - 1);
-    const maxCY = clamp(Math.floor((camY + h + CHUNK_PX) / CHUNK_PX), 0, WORLD_CHUNKS_H - 1);
+    ctx.fillStyle = (currentLayer === LAYER0) ? '#0b2417' : (currentLayer === LAYER1 ? '#070912' : '#0b0509');
+    ctx.fillRect(0, 0, w, h);
 
-    // Draw tiles and entrances
-    for (let cy = minCY; cy <= maxCY; cy++) {
-      for (let cx = minCX; cx <= maxCX; cx++) {
-        const chunk = getChunk(currentLayer, cx, cy, t);
+    renderLayer(currentLayer, now, camX, camY, null);
 
-        const ox = cx * CHUNK_PX - camX;
-        const oy = cy * CHUNK_PX - camY;
+    const entrances = getNearbyEntrances(currentLayer, now);
 
-        // Draw tiles with smoothing
-        for (let ty = 0; ty < CHUNK_TILES; ty++) {
-          for (let tx = 0; tx < CHUNK_TILES; tx++) {
-            const v = chunk.tiles[ty * CHUNK_TILES + tx];
-            const wxTile = cx * CHUNK_TILES + tx;
-            const wyTile = cy * CHUNK_TILES + ty;
-            drawTile(currentLayer, wxTile, wyTile, ox + tx * TILE, oy + ty * TILE, v);
-          }
-        }
-
-        // Chunk border + label
-        if (debug) {
-          ctx.save();
-          ctx.globalAlpha = 0.45;
-          ctx.strokeStyle = '#fff';
-          ctx.lineWidth = 2;
-          ctx.strokeRect(ox, oy, CHUNK_PX, CHUNK_PX);
-          ctx.globalAlpha = 0.95;
-          ctx.fillStyle = '#fff';
-          ctx.font = '12px ui-sans-serif,system-ui';
-          ctx.fillText(`c${cx},${cy}`, ox + 6, oy + 14);
-          ctx.restore();
-        }
-
-        // Entrances
-        for (const e of chunk.entrances) drawEntrance(e, camX, camY);
-      }
+    for (const e of entrances) {
+      const d = Math.hypot(player.x - e.x, player.y - e.y);
+      if (d < TILE * 14) renderOtherLayerInPortal(e, now, camX, camY);
+      drawEntranceRimAndArrow(e, camX, camY);
     }
 
-    // Debug world grid (anchored)
-    if (debug) {
-      drawWorldGrid(camX, camY, w, h, TILE, 0.14);          // small grid
-      drawWorldGrid(camX, camY, w, h, CHUNK_PX, 0.22);       // chunk grid
+    if (transitioning && trans.entrance) {
+      const e = trans.entrance;
+      const p = clamp(trans.progress, 0, 1);
+      const t = easeInOut(p);
+
+      const start = portalStartRectScreen(e, camX, camY);
+      const end = { x: 0, y: 0, w, h, r: 0 };
+      const rect = lerpRect(start, end, t);
+
+      const portalCamX = player.x - w / 2;
+      const portalCamY = player.y - h / 2;
+      renderLayer(e.toLayer, now, portalCamX, portalCamY, rect);
     }
 
-    // Player shadow
     const px = player.x - camX;
     const py = player.y - camY;
+
     ctx.save();
     ctx.globalAlpha = 0.35;
     ctx.fillStyle = '#000';
@@ -722,50 +534,31 @@
     ctx.fill();
     ctx.restore();
 
-    // Player body (rounded square)
     ctx.save();
     ctx.translate(px, py);
     ctx.fillStyle = '#d9f99d';
-    roundRectFill(-player.r, -player.r, player.r * 2, player.r * 2, 6);
+    ctx.fillRect(-player.r, -player.r, player.r * 2, player.r * 2);
     ctx.fillStyle = '#14532d';
-    roundRectFill(-player.r + 3, -player.r + 3, 6, 6, 2);
+    ctx.fillRect(-player.r + 3, -player.r + 3, 6, 6);
     ctx.restore();
 
-    // Entrance proximity UI
-    const entrances = getNearbyEntrances(currentLayer, t);
-    let nearest = null;
-    let nearestD = Infinity;
-    for (const e of entrances) {
-      const d = Math.hypot(player.x - e.x, player.y - e.y);
-      if (d < nearestD) { nearestD = d; nearest = e; }
-    }
-    if (nearest && nearestD < TILE * 3.6) {
-      const names = ['A Hole/Lip', 'B Ramp', 'C Arch', 'D Rune'];
-      entranceInfo.textContent = `Entrance: ${names[nearest.style]} • Walk in from arrow side`;
-      entranceInfo.classList.remove('ghost');
-    } else {
-      entranceInfo.textContent = 'No entrance nearby';
-      entranceInfo.classList.add('ghost');
+    if (entranceInfo) {
+      let nearest = null, best = Infinity;
+      for (const e of entrances) {
+        const d = Math.hypot(player.x - e.x, player.y - e.y);
+        if (d < best) { best = d; nearest = e; }
+      }
+      if (nearest && best < TILE * 4.2) {
+        entranceInfo.textContent = `Portal nearby • walk in`;
+        entranceInfo.classList.remove('ghost');
+      } else {
+        entranceInfo.textContent = `No portal nearby`;
+        entranceInfo.classList.add('ghost');
+      }
     }
 
-    // Auto-start transition if we walk into a mouth in the correct direction
-    if (!transitioning) {
-      maybeStartTransition(entrances, mvx, mvy);
-    }
+    if (!transitioning) tryStartTransition(entrances, mvx, mvy);
 
-    // Transition vignette
-    if (vignette > 0.001) drawVignette(vignette);
-
-    // Cave atmosphere overlay (subtle)
-    if (currentLayer === LAYER_CAVE) {
-      ctx.save();
-      ctx.globalAlpha = 0.10;
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, w, h);
-      ctx.restore();
-    }
-
-    // Debug readout
     if (debug) {
       ctx.save();
       ctx.fillStyle = 'rgba(255,255,255,0.9)';
