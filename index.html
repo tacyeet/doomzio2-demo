@@ -3,30 +3,16 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Doomz Layers + Chunking Demo (2 layers)</title>
+  <title>Doomz.io 3 Layers Demo</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <canvas id="game"></canvas>
+
   <div id="hud">
-    <div class="row">
-      <div class="pill">WASD: move</div>
-      <div class="pill">Shift: sprint</div>
-      <div class="pill">Walk into entrance to change layer</div>
-      <div class="pill">F: toggle debug</div>
-    </div>
-    <div class="row">
-      <div class="stat">Layer: <span id="layer">Surface</span></div>
-      <div class="stat">Chunk: <span id="chunk">(0,0)</span></div>
-      <div class="stat">Pos: <span id="pos">(0,0)</span></div>
-      <div class="stat">Near entrance: <span id="near">No</span></div>
-    </div>
-    <div class="row note" id="note"></div>
-  </div>
-
-  <canvas id="game" width="1280" height="720"></canvas>
-
-  <div id="footer">
-    <span>2 layers • chunk streaming • multiple entrance transition styles • browser-only (no deps)</span>
+    <div id="layerBadge">Layer: Surface</div>
+    <div id="entranceInfo" class="ghost">No entrance nearby</div>
+    <div id="help">WASD move • Shift sprint • Walk into portals • F debug</div>
   </div>
 
   <script src="main.js"></script>
