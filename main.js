@@ -12,6 +12,26 @@
   const canvas = document.getElementById('game');
   const ctx = canvas.getContext('2d');
 
+  // roundRect polyfill for older browsers
+  if (!CanvasRenderingContext2D.prototype.roundRect) {
+    CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
+      const rr = Array.isArray(r) ? r : [r,r,r,r];
+      const [r1,r2,r3,r4] = rr;
+      this.beginPath();
+      this.moveTo(x + r1, y);
+      this.lineTo(x + w - r2, y);
+      this.quadraticCurveTo(x + w, y, x + w, y + r2);
+      this.lineTo(x + w, y + h - r3);
+      this.quadraticCurveTo(x + w, y + h, x + w - r3, y + h);
+      this.lineTo(x + r4, y + h);
+      this.quadraticCurveTo(x, y + h, x, y + h - r4);
+      this.lineTo(x, y + r1);
+      this.quadraticCurveTo(x, y, x + r1, y);
+      return this;
+    };
+  }
+
+
   // ----- World config -----
   const TILE = 16;               // tile size in pixels
   const CHUNK_TILES = 32;        // 32 tiles per chunk
@@ -178,7 +198,7 @@
         // position near chunk center
         const x = cx * CHUNK_PX + CHUNK_PX * 0.5;
         const y = cy * CHUNK_PX + CHUNK_PX * 0.5;
-        entrances.push({ id: idx, cx, cy, x, y, r: 26, type });
+        entrances.push({ id: idx, cx, cy, x, y, w: 56, l: 92, dir: ENTRANCE_DIRS[idx % ENTRANCE_DIRS.length], type, cooldownUntil: 0 });
       }
     }
   }
@@ -196,6 +216,77 @@
       }
     }
     return best;
+  }
+
+  function entranceLocal(e, px, py) {
+    // local coords: s along dir, t along perp
+    const dx = px - e.x;
+    const dy = py - e.y;
+    const dirx = e.dir.dx, diry = e.dir.dy;
+    const perpx = -diry, perpy = dirx;
+    const s = dx * dirx + dy * diry;
+    const t = dx * perpx + dy * perpy;
+    return { s, t, dirx, diry, perpx, perpy };
+  }
+
+  function entranceContains(e, px, py) {
+    const { s, t } = entranceLocal(e, px, py);
+    const halfL = e.l * 0.5;
+    const halfW = e.w * 0.5;
+    return (Math.abs(t) <= halfW) && (s >= -halfL) && (s <= halfL);
+  }
+
+  function entranceFacingDot(e, vx, vy) {
+    // vx/vy are normalized movement intent
+    return vx * e.dir.dx + vy * e.dir.dy;
+  }
+
+  function tryAutoEntrance(now, moveVx, moveVy) {
+    if (transition.running) return;
+    if (now < player.ignoreEntranceUntil) return;
+
+    // Need a clear movement intent (avoid idle-trigger)
+    const mvLen = Math.hypot(moveVx, moveVy);
+    if (mvLen < 0.2) return;
+
+    const near = findNearestEntrance(player.x, player.y, 90);
+    if (!near) return;
+    if (now < near.cooldownUntil) return;
+
+    // Must be inside the tunnel mouth area
+    if (!entranceContains(near, player.x, player.y)) return;
+
+    // Must be moving "into" it (or "out of" it when in cave)
+    const dot = entranceFacingDot(near, moveVx / mvLen, moveVy / mvLen);
+    const into = (activeLayer === 0) ? (dot > 0.55) : (dot < -0.55);
+    if (!into) return;
+
+    const targetLayer = activeLayer === 0 ? 1 : 0;
+    const style = near.type;
+
+    // Prefetch chunks around the entrance in target layer for seamless feel
+    prefetchAround(player.x, player.y, targetLayer, 2);
+
+    // Start a "walk-in" tunnel transition: we keep moving player forward while visuals change.
+    const dirSign = (activeLayer === 0) ? 1 : -1; // flip when exiting
+    runTransition(style.transition, 0.55, {
+      mode: 'tunnel',
+      entrance: near,
+      targetLayer,
+      style,
+      dirSign,
+      _swapped: false,
+      startX: player.x,
+      startY: player.y,
+      // travel distance through the tunnel
+      travel: 92,
+      // snap strength to entrance centerline
+      snap: 0.65,
+    });
+
+    // prevent immediate retrigger
+    player.ignoreEntranceUntil = now + 0.9;
+    near.cooldownUntil = now + 0.9;
   }
 
   // ----- Player & camera -----
@@ -225,13 +316,12 @@
   // ----- Input -----
   const keys = new Set();
   window.addEventListener('keydown', (e) => {
-    if (['KeyW','KeyA','KeyS','KeyD','ShiftLeft','ShiftRight','KeyE','KeyF'].includes(e.code)) {
+    if (['KeyW','KeyA','KeyS','KeyD','ShiftLeft','ShiftRight','KeyF'].includes(e.code)) {
       e.preventDefault();
     }
     keys.add(e.code);
 
     if (e.code === 'KeyF') debug = !debug;
-    if (e.code === 'KeyE') tryUseEntrance();
   }, { passive: false });
   window.addEventListener('keyup', (e) => keys.delete(e.code));
 
@@ -268,21 +358,7 @@
     transition.running = false;
     transition.fn = null;
     transition.data = null;
-  }
-
-  function tryUseEntrance() {
-    if (transition.running) return;
-    const near = findNearestEntrance(player.x, player.y, 60);
-    if (!near) return;
-
-    const targetLayer = activeLayer === 0 ? 1 : 0;
-    const style = near.type;
-
-    // Prefetch chunks around the entrance in target layer for seamless feel
-    prefetchAround(player.x, player.y, targetLayer, 2);
-
-    runTransition(style.transition, 0.55, { entrance: near, targetLayer, style });
-  }
+  } 
 
   // ----- Prefetch helper -----
   function prefetchAround(px, py, layerId, radiusChunks) {
@@ -303,10 +379,6 @@
 
   function crossfadeTransition(alpha, data) {
     // Switch layer at midpoint
-    if (alpha >= 0.5 && !data._swapped) {
-      swapLayer(data);
-      data._swapped = true;
-    }
     // draw overlay handled in render
   }
 
@@ -316,11 +388,6 @@
       ? lerp(1, 1.06, smoothstep(0, 0.5, alpha))
       : lerp(1.06, 1, smoothstep(0.5, 1, alpha));
     camera.zoom = z;
-
-    if (alpha >= 0.5 && !data._swapped) {
-      swapLayer(data);
-      data._swapped = true;
-    }
   }
 
   function slideDownTransition(alpha, data) {
@@ -330,11 +397,6 @@
       ? lerp(0, slide, smoothstep(0, 0.5, alpha))
       : lerp(slide, 0, smoothstep(0.5, 1, alpha));
     data._camSlide = dy;
-
-    if (alpha >= 0.5 && !data._swapped) {
-      swapLayer(data);
-      data._swapped = true;
-    }
   }
 
   function interiorOffsetTransition(alpha, data) {
@@ -380,6 +442,14 @@
   }
 
   function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  function dirToAngle(e) {
+    const dx = e.dir.dx, dy = e.dir.dy;
+    if (dx === 0 && dy === 1) return 0;
+    if (dx === 0 && dy === -1) return Math.PI;
+    if (dx === 1 && dy === 0) return Math.PI / 2;
+    return -Math.PI / 2;
+  }
   function lerp(a, b, t) { return a + (b - a) * t; }
   function smoothstep(a, b, t) {
     t = clamp((t - a) / (b - a), 0, 1);
@@ -432,137 +502,181 @@
     type.renderEntrance(gx, gy, e, layerId);
   }
 
-  function renderHoleEntrance(gx, gy, e, layerId) {
-    // Simple "hole" with radial gradient
+    function renderHoleEntrance(gx, gy, e, layerId) {
+    // "Hole with lip" aligned to entrance direction (reads as depth, not a portal)
     ctx.save();
     ctx.translate(gx, gy);
+    ctx.rotate(dirToAngle(e));
 
-    // rim
-    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    const halfW = e.w * 0.5;
+    const halfL = e.l * 0.5;
+
+    // ground shadow behind the lip (outside)
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
     ctx.beginPath();
-    ctx.ellipse(0, 0, e.r + 10, e.r + 6, -0.4, 0, Math.PI * 2);
+    ctx.ellipse(0, -halfL - 6, halfW * 0.95, 8, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // inner gradient
-    const grad = ctx.createRadialGradient(-6, -6, 6, 0, 0, e.r + 2);
-    grad.addColorStop(0, 'rgba(0,0,0,0.95)');
-    grad.addColorStop(1, 'rgba(0,0,0,0.20)');
-    ctx.fillStyle = grad;
+    // rocky lip (thick rim)
+    const lipGrad = ctx.createLinearGradient(0, -halfL - 12, 0, -halfL + 12);
+    lipGrad.addColorStop(0, 'rgba(255,255,255,0.10)');
+    lipGrad.addColorStop(1, 'rgba(0,0,0,0.18)');
+    ctx.fillStyle = lipGrad;
     ctx.beginPath();
-    ctx.ellipse(0, 0, e.r, e.r - 2, -0.3, 0, Math.PI * 2);
+    ctx.roundRect(-halfW - 8, -halfL - 18, e.w + 16, 24, 10);
     ctx.fill();
 
-    // small shadow cast
-    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    // dark interior (depth gradient)
+    const g = ctx.createLinearGradient(0, -halfL, 0, halfL);
+    g.addColorStop(0, 'rgba(0,0,0,0.96)');
+    g.addColorStop(0.55, 'rgba(0,0,0,0.75)');
+    g.addColorStop(1, 'rgba(0,0,0,0.15)');
+    ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.ellipse(10, 10, e.r, e.r - 4, -0.3, 0, Math.PI * 2);
+    ctx.roundRect(-halfW, -halfL, e.w, e.l, 10);
     ctx.fill();
+
+    // subtle inner edge highlight
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(-halfW, -halfL, e.w, e.l, 10);
+    ctx.stroke();
 
     ctx.restore();
   }
 
-  function renderRampEntrance(gx, gy, e, layerId) {
-    // Perspective ramp/stairs down
+    function renderRampEntrance(gx, gy, e, layerId) {
+    // Ramp / stairwell: perspective narrowing sells "down"
     ctx.save();
     ctx.translate(gx, gy);
+    ctx.rotate(dirToAngle(e));
 
-    // frame
-    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    const halfW = e.w * 0.5;
+    const halfL = e.l * 0.5;
+
+    // ramp trapezoid (narrower deeper)
+    const topW = e.w * 1.05;
+    const botW = e.w * 0.55;
+
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.22)';
     ctx.beginPath();
-    ctx.ellipse(0, 0, e.r + 14, e.r + 10, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, -halfL - 8, topW * 0.45, 9, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // ramp
-    const wTop = e.r + 10;
-    const wBot = e.r - 6;
-    const h = e.r + 18;
-
-    const grad = ctx.createLinearGradient(0, -h * 0.55, 0, h * 0.55);
-    grad.addColorStop(0, 'rgba(255,255,255,0.08)');
-    grad.addColorStop(1, 'rgba(0,0,0,0.70)');
-
-    ctx.fillStyle = grad;
+    const rampGrad = ctx.createLinearGradient(0, -halfL, 0, halfL);
+    rampGrad.addColorStop(0, 'rgba(60,60,80,0.55)');
+    rampGrad.addColorStop(1, 'rgba(0,0,0,0.65)');
+    ctx.fillStyle = rampGrad;
     ctx.beginPath();
-    ctx.moveTo(-wTop, -h * 0.55);
-    ctx.lineTo(wTop, -h * 0.55);
-    ctx.lineTo(wBot, h * 0.55);
-    ctx.lineTo(-wBot, h * 0.55);
+    ctx.moveTo(-topW/2, -halfL);
+    ctx.lineTo(topW/2, -halfL);
+    ctx.lineTo(botW/2, halfL);
+    ctx.lineTo(-botW/2, halfL);
     ctx.closePath();
     ctx.fill();
 
     // steps
-    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-    for (let i = 0; i < 6; i++) {
-      const t = (i + 1) / 7;
-      const y = lerp(-h * 0.45, h * 0.45, t);
-      const w = lerp(wTop, wBot, t);
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 2;
+    const steps = 6;
+    for (let i = 1; i < steps; i++) {
+      const t = i / steps;
+      const y = lerp(-halfL, halfL, t);
+      const w = lerp(topW, botW, t);
       ctx.beginPath();
-      ctx.moveTo(-w + 6, y);
-      ctx.lineTo(w - 6, y);
+      ctx.moveTo(-w/2, y);
+      ctx.lineTo(w/2, y);
       ctx.stroke();
     }
 
+    // mouth darkness at the bottom
+    const mouth = ctx.createRadialGradient(0, halfL - 6, 2, 0, halfL - 6, 26);
+    mouth.addColorStop(0, 'rgba(0,0,0,0.95)');
+    mouth.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = mouth;
+    ctx.beginPath();
+    ctx.ellipse(0, halfL - 6, botW * 0.42, 14, 0, 0, Math.PI*2);
+    ctx.fill();
+
     ctx.restore();
   }
 
-  function renderArchEntrance(gx, gy, e, layerId) {
-    // Cave mouth arch with foreground overhang cue
+    ctx.restore();
+  }
+
+    function renderArchEntrance(gx, gy, e, layerId) {
+    // Cave mouth arch with overhang feel (occlusion cue)
     ctx.save();
     ctx.translate(gx, gy);
+    ctx.rotate(dirToAngle(e));
 
-    // dark interior
-    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    const halfW = e.w * 0.55;
+    const halfL = e.l * 0.5;
+
+    // interior darkness
+    const g = ctx.createLinearGradient(0, -halfL, 0, halfL);
+    g.addColorStop(0, 'rgba(0,0,0,0.95)');
+    g.addColorStop(1, 'rgba(0,0,0,0.20)');
+    ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.ellipse(0, 6, e.r + 6, e.r - 2, 0, 0, Math.PI * 2);
+    ctx.roundRect(-halfW, -halfL, halfW*2, e.l, 14);
     ctx.fill();
 
     // arch rim
-    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
-    ctx.lineWidth = 6;
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.lineWidth = 3;
     ctx.beginPath();
-    ctx.arc(0, 0, e.r + 8, Math.PI * 1.05, Math.PI * 1.95);
+    ctx.roundRect(-halfW-6, -halfL-6, (halfW+6)*2, e.l+12, 18);
     ctx.stroke();
 
-    // overhang highlight (drawn as if above player)
-    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    // overhang shadow (drawn on top edge)
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
     ctx.beginPath();
-    ctx.arc(0, -4, e.r + 10, Math.PI * 1.12, Math.PI * 1.88);
-    ctx.lineTo(0, -4);
-    ctx.closePath();
+    ctx.ellipse(0, -halfL-4, halfW*0.95, 10, 0, 0, Math.PI*2);
     ctx.fill();
+
+    // little rocks
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    ctx.beginPath(); ctx.arc(-halfW-10, -halfL+10, 4, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(halfW+8, -halfL+18, 3, 0, Math.PI*2); ctx.fill();
 
     ctx.restore();
   }
 
-  function renderPitEntrance(gx, gy, e, layerId) {
-    // Pit with "portal" ring (used for interior offset style)
+    function renderPitEntrance(gx, gy, e, layerId) {
+    // "Magic pit" variant: still reads as depth but adds fantasy glow
     ctx.save();
     ctx.translate(gx, gy);
+    ctx.rotate(dirToAngle(e));
 
-    // base pit
-    const grad = ctx.createRadialGradient(0, 0, 4, 0, 0, e.r + 10);
-    grad.addColorStop(0, 'rgba(0,0,0,0.95)');
-    grad.addColorStop(1, 'rgba(0,0,0,0.10)');
-    ctx.fillStyle = grad;
+    const halfW = e.w * 0.5;
+    const halfL = e.l * 0.5;
+
+    // outer rim
+    ctx.fillStyle = 'rgba(255,255,255,0.10)';
     ctx.beginPath();
-    ctx.ellipse(0, 0, e.r + 4, e.r, 0.25, 0, Math.PI * 2);
+    ctx.roundRect(-halfW-8, -halfL-8, e.w+16, e.l+16, 12);
     ctx.fill();
 
-    // magic ring
-    ctx.strokeStyle = 'rgba(167,139,250,0.55)';
-    ctx.lineWidth = 3;
+    // inner dark
+    ctx.fillStyle = 'rgba(0,0,0,0.80)';
     ctx.beginPath();
-    ctx.ellipse(0, 0, e.r + 10, e.r + 6, 0.25, 0, Math.PI * 2);
-    ctx.stroke();
+    ctx.roundRect(-halfW, -halfL, e.w, e.l, 10);
+    ctx.fill();
 
-    // small runes
-    ctx.fillStyle = 'rgba(167,139,250,0.35)';
-    for (let i = 0; i < 10; i++) {
-      const a = (i / 10) * Math.PI * 2;
-      const rx = Math.cos(a) * (e.r + 12);
-      const ry = Math.sin(a) * (e.r + 8);
-      ctx.fillRect(rx - 1, ry - 1, 2, 2);
-    }
+    // faint glow (changes per layer to show it's an "entrance", not a portal)
+    const glow = ctx.createRadialGradient(0, 0, 4, 0, 0, 48);
+    glow.addColorStop(0, layerId === 0 ? 'rgba(59,130,246,0.22)' : 'rgba(168,85,247,0.20)');
+    glow.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, halfW*1.05, halfL*0.85, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.restore();
+  }
 
     ctx.restore();
   }
@@ -743,16 +857,58 @@
     if (keys.has('KeyA')) vx -= 1;
     if (keys.has('KeyD')) vx += 1;
 
-    if (vx !== 0 || vy !== 0) {
-      const len = Math.hypot(vx, vy) || 1;
-      vx /= len; vy /= len;
-      player.x += vx * spd * dt;
-      player.y += vy * spd * dt;
+    let intentVx = vx, intentVy = vy;
+
+    // If a tunnel transition is running, we 'walk' the player through the entrance and ignore manual input.
+    if (transition.running && transition.data && transition.data.mode === 'tunnel') {
+      const d = transition.data;
+      const e = d.entrance;
+      const alpha = clamp(transition.t / transition.dur, 0, 1);
+
+      // Move forward through the entrance
+      const dirx = e.dir.dx * d.dirSign;
+      const diry = e.dir.dy * d.dirSign;
+
+      // Progress-based travel (feels consistent regardless of fps)
+      const dist = (alpha) * d.travel;
+      const baseX = d.startX + dirx * dist;
+      const baseY = d.startY + diry * dist;
+
+      // Snap slightly toward the entrance centerline to avoid sideways 'portal' feel
+      const loc = entranceLocal(e, baseX, baseY);
+      const halfW = e.w * 0.5;
+      const clampedT = clamp(loc.t, -halfW, halfW);
+      const snappedX = e.x + (loc.s * loc.dirx) + (clampedT * loc.perpx);
+      const snappedY = e.y + (loc.s * loc.diry) + (clampedT * loc.perpy);
+
+      player.x = lerp(baseX, snappedX, d.snap);
+      player.y = lerp(baseY, snappedY, d.snap);
+
+      // Swap layers at midpoint (visual-only fns no longer swap)
+      if (alpha >= 0.5 && !d._swapped) {
+        swapLayer(d);
+        d._swapped = true;
+      }
+
+      // No further movement this frame
+      intentVx = dirx;
+      intentVy = diry;
+    } else {
+      if (vx !== 0 || vy !== 0) {
+        const len = Math.hypot(vx, vy) || 1;
+        vx /= len; vy /= len;
+        intentVx = vx; intentVy = vy;
+        player.x += vx * spd * dt;
+        player.y += vy * spd * dt;
+      }
     }
 
     // Bounds
     player.x = clamp(player.x, player.r, WORLD_PX_W - player.r);
     player.y = clamp(player.y, player.r, WORLD_PX_H - player.r);
+
+    // Auto-enter/exit entrances by walking into them
+    tryAutoEntrance(now / 1000, intentVx, intentVy);
 
     // Camera follow
     camera.x = lerp(camera.x, player.x, 1 - Math.pow(0.001, dt));
@@ -790,4 +946,6 @@
   prefetchAround(player.x, player.y, activeLayer, 3);
 
   requestAnimationFrame(update);
-})();
+})();  const ENTRANCE_DIRS = [
+    {dx:0,dy:1}, {dx:0,dy:-1}, {dx:1,dy:0}, {dx:-1,dy:0}
+  ];
